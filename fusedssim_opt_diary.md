@@ -1,6 +1,7 @@
 ## V1: Remove Redundancy
 
-**Roughly Remove Redundant Operation** 删除冗余的赋值和同步操作
+- **Roughly Remove Redundant Operation** 删除冗余的赋值和同步操作
+- Fix the bug of accessing out-of-boundary elements in `do_separable_conv_x` and `do_separable_conv_y` function
 
 Before Opt.:
 ```cpp
