@@ -1,2 +1,8 @@
 build/
 fused_ssim.egg-info/
+
+*__pycache__/
+*.sh
+*.bak
+*.nsys-rep
+*.ncu-rep

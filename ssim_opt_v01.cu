@@ -28,9 +28,9 @@ namespace cg = cooperative_groups;
 #define SY (BY + 10)
 
 // convolution scratchpad size
-#define CX (BX)
-#define CCX (BX + 0)
-#define CY (BY + 10)
+#define CX (1)
+#define CCX (1)
+#define CY (1)
 
 /**
  * Get pixel value from image
@@ -140,7 +140,7 @@ __device__ void do_separable_conv_x(float pixels[SY][SSX], float opt[CY][CCX], i
     val += G_09 * pixels[local_y][local_x + 4];
     val += G_10 * pixels[local_y][local_x + 5];
   }
-  opt[local_y][local_x-5] = val;
+  opt[local_y][local_x] = val;
 
   val = 0.0f;
   local_y = block.thread_index().y + BY;
@@ -170,14 +170,14 @@ __device__ void do_separable_conv_x(float pixels[SY][SSX], float opt[CY][CCX], i
       val += G_09 * pixels[local_y][local_x + 4];
       val += G_10 * pixels[local_y][local_x + 5];
     }
-    opt[local_y][local_x-5] = val;
+    opt[local_y][local_x] = val;
   }
 }
 
 __device__ float do_separable_conv_y(float pixels[CY][CCX], int H, int W, bool sq = false) {
   auto block = cg::this_thread_block();
   int local_y = block.thread_index().y + 5;
-  int local_x = block.thread_index().x;
+  int local_x = block.thread_index().x + 5;
   float val = 0.0f;
 
   val += G_00 * pixels[local_y - 5][local_x];
@@ -227,25 +227,18 @@ __global__ void fusedssimCUDA(
     block.sync();
 
     // calculate mu1
-    flush_conv_scratch(buf3);
-    block.sync();
     do_separable_conv_x(buf1, buf3, H, W);
     block.sync();
     float mu1 = do_separable_conv_y(buf3, H, W);
     block.sync();
 
     // calculate sigma1_sq
-    flush_conv_scratch(buf3);
-    block.sync();
     do_separable_conv_x(buf1, buf3, H, W, true);
     block.sync();
     float sigma1_sq = do_separable_conv_y(buf3, H, W) - mu1 * mu1;
-    block.sync();
 
     // calculate mu2
     load_into_shared(buf2, img2, CH, H, W, i);
-    block.sync();
-    flush_conv_scratch(buf3);
     block.sync();
     do_separable_conv_x(buf2, buf3, H, W);
     block.sync();
@@ -253,8 +246,6 @@ __global__ void fusedssimCUDA(
     block.sync();
 
     // calculate sigma2_sq
-    flush_conv_scratch(buf3);
-    block.sync();
     do_separable_conv_x(buf2, buf3, H, W, true);
     block.sync();
     float sigma2_sq = do_separable_conv_y(buf3, H, W) - mu2 * mu2;
@@ -262,8 +253,6 @@ __global__ void fusedssimCUDA(
 
     // calculate sigma12
     multiply_shared_mem(buf1, buf2);
-    block.sync();
-    flush_conv_scratch(buf3);
     block.sync();
     do_separable_conv_x(buf1, buf3, H, W);
     block.sync();
@@ -377,7 +366,7 @@ __global__ void fusedssim_backwardCUDA(
 }
 
 std::tuple<torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor>
-fusedssim(
+fusedssim_opt(
   float C1,
   float C2,
   torch::Tensor &img1,
@@ -415,7 +404,7 @@ fusedssim(
 }
 
 torch::Tensor
-fusedssim_backward(
+fusedssim_opt_backward(
   float C1,
   float C2,
   torch::Tensor &img1,
