@@ -28,9 +28,9 @@ namespace cg = cooperative_groups;
 #define SY (BY + 10)
 
 // convolution scratchpad size
-#define CX (1)
-#define CCX (1)
-#define CY (1)
+#define CX (BX)
+#define CCX (BX + 0)
+#define CY (BY + 10)
 
 /**
  * Get pixel value from image
