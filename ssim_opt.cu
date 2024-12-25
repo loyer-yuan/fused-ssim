@@ -65,7 +65,7 @@ __device__ __forceinline__ float get_pix_value(const float* img, const int b, co
 // TODO: Use async copy for loading pixels
 __device__ void load_into_shared(float * __restrict__ pixels, const float * __restrict__ inp, const int CH, const int H, const int W, const int i) {
   auto block = cg::this_thread_block();
-  const int batch = block.group_index().z;
+  const int batch = 0;
   const int start_y = block.group_index().y * BY;
   const int start_x = block.group_index().x * BX;
 
@@ -247,7 +247,8 @@ __global__ void fusedssimCUDA(
   const int pix_x = block.group_index().x * BX + block.thread_index().x * TILE_SIZE;
   const int pix_id = pix_y * W + pix_x;
   const int num_pix = H * W;
-  const int batch = block.group_index().z;
+  const int i = block.group_index().z;
+  const int batch = 0;
 
   // shared memory that will be used to load pixels temporarily
   __shared__ float sbuf1[SY*SX];
@@ -261,80 +262,78 @@ __global__ void fusedssimCUDA(
   float sigma2_sq_arr[TILE_SIZE];
   float sigma12_arr[TILE_SIZE];
 
-  for (int i = 0; i < CH; ++i) {
-    // load into shared
-    load_into_shared(sbuf1, img1, CH, H, W, i);
-    block.sync();
+  // load into shared
+  load_into_shared(sbuf1, img1, CH, H, W, i);
+  block.sync();
 
-    load_into_shared(sbuf2, img2, CH, H, W, i);
+  load_into_shared(sbuf2, img2, CH, H, W, i);
 
-    // calculate mu1
-    do_separable_conv_x<false>(sbuf1, sbuf3, rbuf1);
-    block.sync();
-    do_separable_conv_y<false>(sbuf3, mu1_arr);
-    block.sync();
+  // calculate mu1
+  do_separable_conv_x<false>(sbuf1, sbuf3, rbuf1);
+  block.sync();
+  do_separable_conv_y<false>(sbuf3, mu1_arr);
+  block.sync();
 
-    // calculate sigma1_sq
-    do_separable_conv_x<true>(sbuf1, sbuf3, rbuf1);
-    block.sync();
-    do_separable_conv_y<false>(sbuf3, sigma1_sq_arr);
-    // block.sync();
-    do_elementwise_mul_sub<TILE_SIZE>(sigma1_sq_arr, mu1_arr, mu1_arr);
+  // calculate sigma1_sq
+  do_separable_conv_x<true>(sbuf1, sbuf3, rbuf1);
+  block.sync();
+  do_separable_conv_y<false>(sbuf3, sigma1_sq_arr);
+  // block.sync();
+  do_elementwise_mul_sub<TILE_SIZE>(sigma1_sq_arr, mu1_arr, mu1_arr);
 
-    // calculate mu2
-    // block.sync();
-    do_separable_conv_x<false>(sbuf2, sbuf3, rbuf1);
-    block.sync();
-    do_separable_conv_y<false>(sbuf3, mu2_arr);
-    // block.sync();
+  // calculate mu2
+  // block.sync();
+  do_separable_conv_x<false>(sbuf2, sbuf3, rbuf1);
+  block.sync();
+  do_separable_conv_y<false>(sbuf3, mu2_arr);
+  // block.sync();
 
-    // calculate sigma2_sq
-    do_separable_conv_x<true>(sbuf2, sbuf3, rbuf1);
-    block.sync();
-    do_separable_conv_y<false>(sbuf3, sigma2_sq_arr);
-    do_elementwise_mul_sub<TILE_SIZE>(sigma2_sq_arr, mu2_arr, mu2_arr);
-    // block.sync();
+  // calculate sigma2_sq
+  do_separable_conv_x<true>(sbuf2, sbuf3, rbuf1);
+  block.sync();
+  do_separable_conv_y<false>(sbuf3, sigma2_sq_arr);
+  do_elementwise_mul_sub<TILE_SIZE>(sigma2_sq_arr, mu2_arr, mu2_arr);
+  // block.sync();
 
-    // calculate sigma12
-    multiply_shared_mem(sbuf1, sbuf2);
-    block.sync();
-    do_separable_conv_x<false>(sbuf1, sbuf3, rbuf1);
-    block.sync();
-    do_separable_conv_y<false>(sbuf3, sigma12_arr);
-    do_elementwise_mul_sub<TILE_SIZE>(sigma12_arr, mu1_arr, mu2_arr);
-    block.sync();
+  // calculate sigma12
+  multiply_shared_mem(sbuf1, sbuf2);
+  block.sync();
+  do_separable_conv_x<false>(sbuf1, sbuf3, rbuf1);
+  block.sync();
+  do_separable_conv_y<false>(sbuf3, sigma12_arr);
+  do_elementwise_mul_sub<TILE_SIZE>(sigma12_arr, mu1_arr, mu2_arr);
+  block.sync();
 
-    // calculate SSIM
-    #pragma unroll
-    for (int ii = 0; ii < TILE_SIZE; ++ii) {
-      const float mu1 = mu1_arr[ii];
-      const float mu2 = mu2_arr[ii];
-      const float sigma1_sq = sigma1_sq_arr[ii];
-      const float sigma2_sq = sigma2_sq_arr[ii];
-      const float sigma12 = sigma12_arr[ii];
+  // calculate SSIM
+  #pragma unroll
+  for (int ii = 0; ii < TILE_SIZE; ++ii) {
+    const float mu1 = mu1_arr[ii];
+    const float mu2 = mu2_arr[ii];
+    const float sigma1_sq = sigma1_sq_arr[ii];
+    const float sigma2_sq = sigma2_sq_arr[ii];
+    const float sigma12 = sigma12_arr[ii];
 
-      float mu1_sq = mu1 * mu1;
-      float mu2_sq = mu2 * mu2;
-      float mu1_mu2 = mu1 * mu2;
-      float C = (2.0f * mu1_mu2 + C1);
-      float D = (2.0f * sigma12 + C2);
-      float A = (mu1_sq + mu2_sq + C1);
-      float B = (sigma1_sq + sigma2_sq + C2);
-      float m = (C * D) / (A * B);
-      if (pix_x + ii < W && pix_y < H) {
-        const int global_idx = batch * CH * num_pix + i * num_pix + pix_id + ii;
-        ssim_map[global_idx] = m;
+    float mu1_sq = mu1 * mu1;
+    float mu2_sq = mu2 * mu2;
+    float mu1_mu2 = mu1 * mu2;
+    float C = (2.0f * mu1_mu2 + C1);
+    float D = (2.0f * sigma12 + C2);
+    float A = (mu1_sq + mu2_sq + C1);
+    float B = (sigma1_sq + sigma2_sq + C2);
+    float m = (C * D) / (A * B);
+    if (pix_x + ii < W && pix_y < H) {
+      const int global_idx = batch * CH * num_pix + i * num_pix + pix_id + ii;
+      ssim_map[global_idx] = m;
 
-        if (dm_dmu1) {
-          dm_dmu1[global_idx] = (
-            (mu2 * 2.0f * D) / (A * B)
-            -(mu2 * 2.0f * C) / (A * B)
-            -(mu1 * 2.0f * C * D) / ( A * A * B)
-            +(mu1 * 2.0f * C * D) / (A * B * B)
-          );
-          dm_dsigma1_sq[global_idx] = ((-C * D) / (A * B * B));
-          dm_dsigma12[global_idx] = ((2 * C) / (A * B));
-        }
+      if (dm_dmu1) {
+        dm_dmu1[global_idx] = (
+          (mu2 * 2.0f * D) / (A * B)
+          -(mu2 * 2.0f * C) / (A * B)
+          -(mu1 * 2.0f * C * D) / ( A * A * B)
+          +(mu1 * 2.0f * C * D) / (A * B * B)
+        );
+        dm_dsigma1_sq[global_idx] = ((-C * D) / (A * B * B));
+        dm_dsigma12[global_idx] = ((2 * C) / (A * B));
       }
     }
   }
@@ -434,7 +433,7 @@ fusedssim_opt(
   int CH = img1.size(1);
   int H = img1.size(2);
   int W = img1.size(3);
-  dim3 grid((W + BX - 1) / BX, (H + BY - 1) / BY, B);
+  dim3 grid((W + BX - 1) / BX, (H + BY - 1) / BY, CH);
   // dim3 block(BX, BY, 1);
   dim3 block(WARP_SIZE, WARP_NUM, 1);
 

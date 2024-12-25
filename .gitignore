@@ -6,3 +6,4 @@ fused_ssim.egg-info/
 *.bak
 *.nsys-rep
 *.ncu-rep
+*.log
