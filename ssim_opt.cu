@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <iostream>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda_pipeline.h>
 
 namespace cg = cooperative_groups;
 
-#define DEBUG_CON (block.group_index().x == 1 && block.group_index().y == 1 && block.group_index().z == 0 && block.thread_index().x == 0 && block.thread_index().y == 0)
+#define DEBUG_CON1 (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
+#define DEBUG_CON2 (blockIdx.x == (gridDim.x-1) && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 31)
+#define DEBUG_CON3 (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 3)
+#define DEBUG_CON DEBUG_CON3
 
 #define G_00 0.001028380123898387f
 #define G_01 0.0075987582094967365f
@@ -21,7 +25,14 @@ namespace cg = cooperative_groups;
 #define G_10 0.001028380123898387f
 
 #define WARP_SIZE 32
-#define WARP_NUM 8
+#define WARP_NUM 1
+
+#define WINDOW_SIZE 11
+#define SLIDING_STEPS 1
+// #define SLIDING_TIMES (8*9)
+#define SLIDING_TIMES 32
+#define SLIDING_LEN (SLIDING_TIMES * SLIDING_STEPS)
+
 // #define TILE_SIZE 4
 // #define TILE_SIZE 3
 #define TILE_SIZE 2
@@ -29,12 +40,12 @@ namespace cg = cooperative_groups;
 #define RBUF_SIZE (10 + TILE_SIZE)
 
 // block size
-#define BX (WARP_SIZE * TILE_SIZE)
-#define BY (WARP_NUM)
+#define BX (WARP_SIZE * TILE_SIZE * WARP_NUM)
+#define BY (SLIDING_LEN)
 
 // shared memory size
 #define SX (BX + 10)
-#define SY (BY + 10)
+#define SY (1)
 
 // convolution scratchpad size
 #define CX (BX)
@@ -53,6 +64,7 @@ namespace cg = cooperative_groups;
  * @param H Height of image
  * @param W Width of image
  */
+/*
 __device__ __forceinline__ float get_pix_value(const float* img, const int b, const int c, const int y, const int x, const int CH, const int H, const int W) {
   if (x >= W || y >= H || x < 0 || y < 0) {
     return 0.0f;
@@ -60,7 +72,9 @@ __device__ __forceinline__ float get_pix_value(const float* img, const int b, co
     return img[b * CH * H * W + c * H * W + y * W + x];
   }
 }
+*/
 
+/*
 // TODO: Use float4 for loading 4 pixels at once
 // TODO: Use async copy for loading pixels
 __device__ void load_into_shared(float * __restrict__ pixels, const float * __restrict__ inp, const int CH, const int H, const int W, const int i) {
@@ -84,7 +98,31 @@ __device__ void load_into_shared(float * __restrict__ pixels, const float * __re
     }
   }
 }
+*/
 
+/**
+ * @brief Load pixels into shared memory asynchronously with only one warp.
+ */
+template<int len>
+__device__ inline void ld1row_into_shared_async(float * __restrict__ s_row_pixels, const float * __restrict__ d_images, const int CH, const int H, const int W, const int warp_start_x, const int warp_start_y) {
+  const int fillzero_y = (warp_start_y < 0 || warp_start_y >= H);
+  // const int lane = threadIdx.x & 0x1f;
+  const int lane = threadIdx.x;
+  for (int i = lane; i < len; i += WARP_SIZE) {
+    const int cur_x = warp_start_x + i;
+    const int cur_y = warp_start_y;
+    const int fillzero = fillzero_y || (cur_x < 0 || cur_x >= W);
+    if (fillzero) {
+      s_row_pixels[i] = 0.0f;
+    } else {
+      __pipeline_memcpy_async(s_row_pixels + i, d_images + blockIdx.z * H * W + cur_y * W + cur_x, sizeof(float));
+    }
+    // __pipeline_memcpy_async(s_row_pixels + i, d_images + blockIdx.z * H * W + cur_y * W + cur_x, sizeof(float)), fillzero;
+  }
+  __pipeline_commit();
+}
+
+/*
 __device__ void multiply_shared_mem(float * __restrict__ pix1, const float * __restrict__ pix2) {
   auto block = cg::this_thread_block();
   const int cnt = SY * SX;
@@ -101,7 +139,9 @@ __device__ void multiply_shared_mem(float * __restrict__ pix1, const float * __r
     }
   }
 }
+*/
 
+/*
 __device__ void
 flush_conv_scratch(float buf[CY][CX]) {
   auto block = cg::this_thread_block();
@@ -117,7 +157,7 @@ flush_conv_scratch(float buf[CY][CX]) {
     }
   }
 }
-
+*/
 __device__ __forceinline__ float do_sq(float val) {
   return val * val;
 }
@@ -182,6 +222,56 @@ __device__ __forceinline__ float do_conv(const float * __restrict__ pixels, int 
   return val;
 }
 
+template<bool sq>
+__device__ __forceinline__ float do_conv_x(const float * __restrict__ pixels, int w) {
+  float val = 0.0f;
+  // calculate along width/x dimension
+  if constexpr (sq) {
+    val += G_00 * do_sq(pixels[w - 5]);
+    val += G_01 * do_sq(pixels[w - 4]);
+    val += G_02 * do_sq(pixels[w - 3]);
+    val += G_03 * do_sq(pixels[w - 2]);
+    val += G_04 * do_sq(pixels[w - 1]);
+    val += G_05 * do_sq(pixels[w    ]);
+    val += G_06 * do_sq(pixels[w + 1]);
+    val += G_07 * do_sq(pixels[w + 2]);
+    val += G_08 * do_sq(pixels[w + 3]);
+    val += G_09 * do_sq(pixels[w + 4]);
+    val += G_10 * do_sq(pixels[w + 5]);
+  } else {
+    val += G_00 * pixels[w - 5];
+    val += G_01 * pixels[w - 4];
+    val += G_02 * pixels[w - 3];
+    val += G_03 * pixels[w - 2];
+    val += G_04 * pixels[w - 1];
+    val += G_05 * pixels[w    ];
+    val += G_06 * pixels[w + 1];
+    val += G_07 * pixels[w + 2];
+    val += G_08 * pixels[w + 3];
+    val += G_09 * pixels[w + 4];
+    val += G_10 * pixels[w + 5];
+    }
+  return val;
+}
+
+template<int width>
+__device__ __forceinline__ float do_conv_y(const float * __restrict__ pixels, const int start_h, const int w) {
+  float val = 0.0f;
+  val += G_00 * pixels[((start_h +  0) % WINDOW_SIZE)*width + w];
+  val += G_01 * pixels[((start_h +  1) % WINDOW_SIZE)*width + w];
+  val += G_02 * pixels[((start_h +  2) % WINDOW_SIZE)*width + w];
+  val += G_03 * pixels[((start_h +  3) % WINDOW_SIZE)*width + w];
+  val += G_04 * pixels[((start_h +  4) % WINDOW_SIZE)*width + w];
+  val += G_05 * pixels[((start_h +  5) % WINDOW_SIZE)*width + w];
+  val += G_06 * pixels[((start_h +  6) % WINDOW_SIZE)*width + w];
+  val += G_07 * pixels[((start_h +  7) % WINDOW_SIZE)*width + w];
+  val += G_08 * pixels[((start_h +  8) % WINDOW_SIZE)*width + w];
+  val += G_09 * pixels[((start_h +  9) % WINDOW_SIZE)*width + w];
+  val += G_10 * pixels[((start_h + 10) % WINDOW_SIZE)*width + w];
+  return val;
+}
+
+/*
 template<int len, int width>
 __device__ inline void load_into_reg(float * __restrict__ buf, const float * __restrict__ pixels, int h, int w) {
   #pragma unroll
@@ -189,7 +279,52 @@ __device__ inline void load_into_reg(float * __restrict__ buf, const float * __r
     buf[i] = pixels[h*width + w + i];
   }
 }
+*/
 
+/*
+template<int len, int dest_width, int src_width>
+__device__ inline void mv_data_2d(float * __restrict__ dest, const float * __restrict__ src, int dest_y, int dest_x, int src_y, int src_x) {
+  #pragma unroll
+  for (int i = 0; i < len; ++i) {
+    dest[dest_y*dest_width + dest_x + i] = src[src_y*src_width + src_x + i];
+  }
+}
+*/
+
+template<int len>
+__device__ inline void mv_data_1d(float * __restrict__ dest, const float * __restrict__ src, int offset_x) {
+  // mv_data_2d<len, 0, 0>(dest, src, 0, dest_x, 0, src_x);
+  #pragma unroll
+  for (int i = 0; i < len; ++i) {
+    dest[i] = src[offset_x + i];
+  }
+}
+
+template<int len>
+__device__ inline void mv_mul_data_1d(float * __restrict__ dest, const float * __restrict__ src, int offset_x) {
+  #pragma unroll
+  for (int i = 0; i < len; ++i) {
+    dest[i] *= src[offset_x + i];
+  }
+}
+
+template<int sq, int tile_size>
+__device__ inline void do_conv_x_1row(float * __restrict__ dest, const float * __restrict__ src) {
+  #pragma unroll
+  for (int i = 0; i < tile_size; ++i) {
+    dest[i] = do_conv_x<sq>(src, i+5);
+  }
+}
+
+template<int tile_size>
+__device__ inline void do_conv_y_col(float * __restrict__ dest, const float * __restrict__ src, const int start_y = 0) {
+  #pragma unroll
+  for (int i = 0; i < tile_size; ++i) {
+    dest[i] = do_conv_y<tile_size>(src, start_y, i);
+  }
+}
+
+/*
 template<bool sq>
 __device__ inline void do_separable_conv_x(const float * __restrict__ pixels, float * __restrict__ opt, float * __restrict__ buf) {
   auto block = cg::this_thread_block();
@@ -219,6 +354,7 @@ __device__ inline void do_separable_conv_y(const float * __restrict__ pixels, fl
     output[i] = do_conv<CX, false, sq>(pixels, local_y, local_x + i);
   }
 }
+*/
 
 template<int len>
 __device__ __forceinline__ void do_elementwise_mul_sub(float * out, const float * f1, const float * f2) {
@@ -228,6 +364,150 @@ __device__ __forceinline__ void do_elementwise_mul_sub(float * out, const float 
   }
 }
 
+__global__ void fusedssimCUDA(
+  int H,
+  int W,
+  int CH,
+  float C1,
+  float C2,
+  float* img1,
+  float* img2,
+  float* ssim_map,
+  float* dm_dmu1 = nullptr,
+  float* dm_dsigma1_sq = nullptr,
+  float* dm_dsigma12 = nullptr
+) {
+  assert(BY >= SLIDING_STEPS*2);
+
+  const int block_data_x = blockIdx.x * BX;
+  const int block_data_y = blockIdx.y * BY;
+  const int thread_local_data_x = threadIdx.x*TILE_SIZE;
+  const int channel = blockIdx.z;
+
+  __shared__ float sbuf1[SX];
+  __shared__ float sbuf2[SX];
+  float rbuf0[RBUF_SIZE];
+  float rbuf0_mul[RBUF_SIZE];
+  float rbuf1[TILE_SIZE*WINDOW_SIZE];
+  float rbuf1_sq[TILE_SIZE*WINDOW_SIZE];
+  float rbuf2[TILE_SIZE*WINDOW_SIZE];
+  float rbuf2_sq[TILE_SIZE*WINDOW_SIZE];
+  float rbuf3[TILE_SIZE*WINDOW_SIZE];
+  
+  float mu1_arr[TILE_SIZE];
+  float sigma1_sq_arr[TILE_SIZE];
+  float mu2_arr[TILE_SIZE];
+  float sigma2_sq_arr[TILE_SIZE];
+  float sigma12_arr[TILE_SIZE];
+  
+  // fulfill the pipeline
+  ld1row_into_shared_async<SX>(sbuf1, img1, CH, H, W, block_data_x-5, block_data_y-5);
+  ld1row_into_shared_async<SX>(sbuf2, img2, CH, H, W, block_data_x-5, block_data_y-5);
+  for (int i = 0; i < WINDOW_SIZE; ++i) {
+    __pipeline_wait_prior(1);
+    mv_data_1d<RBUF_SIZE>(rbuf0, sbuf1, thread_local_data_x);
+    mv_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf1, thread_local_data_x);
+    ld1row_into_shared_async<SX>(sbuf1, img1, CH, H, W, block_data_x-5, block_data_y-5+i+1); // load i+1 data
+    do_conv_x_1row<false, TILE_SIZE>(rbuf1 + i*TILE_SIZE, rbuf0);
+    do_conv_x_1row<true, TILE_SIZE>(rbuf1_sq + i*TILE_SIZE, rbuf0);
+
+    __pipeline_wait_prior(1);
+    mv_data_1d<RBUF_SIZE>(rbuf0, sbuf2, thread_local_data_x);
+    mv_mul_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf2, thread_local_data_x);
+    ld1row_into_shared_async<SX>(sbuf2, img2, CH, H, W, block_data_x-5, block_data_y-5+i+1);  // load i+1 data
+    do_conv_x_1row<false, TILE_SIZE>(rbuf2 + i*TILE_SIZE, rbuf0);
+    do_conv_x_1row<true, TILE_SIZE>(rbuf2_sq + i*TILE_SIZE, rbuf0);
+    do_conv_x_1row<false, TILE_SIZE>(rbuf3 + i*TILE_SIZE, rbuf0_mul);
+  }
+  
+  // Sliding the window, wuhu!
+  for (int sliding_idx = 0; sliding_idx < SLIDING_TIMES; ++sliding_idx) {
+    int replace_y = sliding_idx % WINDOW_SIZE;
+
+    // stage 1-0: calculate y-dimensional convolution
+    do_conv_y_col<TILE_SIZE>(mu1_arr, rbuf1, replace_y); // mu1
+    do_conv_y_col<TILE_SIZE>(sigma1_sq_arr, rbuf1_sq, replace_y); // sigma1_sq
+    do_elementwise_mul_sub<TILE_SIZE>(sigma1_sq_arr, mu1_arr, mu1_arr);
+    do_conv_y_col<TILE_SIZE>(mu2_arr, rbuf2, replace_y); // mu2
+    do_conv_y_col<TILE_SIZE>(sigma2_sq_arr, rbuf2_sq, replace_y); // sigma2_sq
+    do_elementwise_mul_sub<TILE_SIZE>(sigma2_sq_arr, mu2_arr, mu2_arr);
+    do_conv_y_col<TILE_SIZE>(sigma12_arr, rbuf3, replace_y); // sigma12
+    do_elementwise_mul_sub<TILE_SIZE>(sigma12_arr, mu1_arr, mu2_arr);
+    
+    // stage 1-1: calculate SSIM
+    #pragma unroll
+    for (int ii = 0; ii < TILE_SIZE; ++ii) {
+      const float mu1 = mu1_arr[ii];
+      const float mu2 = mu2_arr[ii];
+      const float sigma1_sq = sigma1_sq_arr[ii];
+      const float sigma2_sq = sigma2_sq_arr[ii];
+      const float sigma12 = sigma12_arr[ii];
+
+      const float mu1_sq = mu1 * mu1;
+      const float mu2_sq = mu2 * mu2;
+      const float mu1_mu2 = mu1 * mu2;
+      const float C = (2.0f * mu1_mu2 + C1);
+      const float D = (2.0f * sigma12 + C2);
+      const float A = (mu1_sq + mu2_sq + C1);
+      const float B = (sigma1_sq + sigma2_sq + C2);
+      const float m = (C * D) / (A * B);
+
+      const int pix_x = block_data_x + thread_local_data_x + ii;
+      const int pix_y = block_data_y + sliding_idx;
+      if (pix_x < W && pix_y < H) {
+        const int global_idx = channel * H * W + pix_y * W + pix_x;
+        ssim_map[global_idx] = m;
+        if (dm_dmu1) {
+          dm_dmu1[global_idx] = (
+            (mu2 * 2.0f * D) / (A * B)
+            -(mu2 * 2.0f * C) / (A * B)
+            -(mu1 * 2.0f * C * D) / ( A * A * B)
+            +(mu1 * 2.0f * C * D) / (A * B * B)
+          );
+          dm_dsigma1_sq[global_idx] = ((-C * D) / (A * B * B));
+          dm_dsigma12[global_idx] = ((2 * C) / (A * B));
+        }
+      }
+    }
+
+    // stage 0: load new data
+    if (sliding_idx+2 < SLIDING_TIMES) {
+      const int ldg_y = block_data_y+5 + sliding_idx+2;
+      // load sliding_idx + 1 row's data
+      __pipeline_wait_prior(1);
+      mv_data_1d<RBUF_SIZE>(rbuf0, sbuf1, thread_local_data_x);
+      mv_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf1, thread_local_data_x);
+      // load sliding_idx + 2 row's data
+      ld1row_into_shared_async<SX>(sbuf1, img1, CH, H, W, block_data_x-5, ldg_y);
+      do_conv_x_1row<false, TILE_SIZE>(rbuf1 + replace_y*TILE_SIZE, rbuf0);
+      do_conv_x_1row<true, TILE_SIZE>(rbuf1_sq + replace_y*TILE_SIZE, rbuf0);
+
+      __pipeline_wait_prior(1);
+      mv_data_1d<RBUF_SIZE>(rbuf0, sbuf2, thread_local_data_x);
+      mv_mul_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf2, thread_local_data_x);
+      ld1row_into_shared_async<SX>(sbuf2, img2, CH, H, W, block_data_x-5, ldg_y);
+      do_conv_x_1row<false, TILE_SIZE>(rbuf2 + replace_y*TILE_SIZE, rbuf0);
+      do_conv_x_1row<true, TILE_SIZE>(rbuf2_sq + replace_y*TILE_SIZE, rbuf0);
+      do_conv_x_1row<false, TILE_SIZE>(rbuf3 + replace_y*TILE_SIZE, rbuf0_mul);
+    } else if (sliding_idx+1 == SLIDING_TIMES-1) { // load the last row
+      // load sliding_idx + 1 row's data
+      __pipeline_wait_prior(1);
+      mv_data_1d<RBUF_SIZE>(rbuf0, sbuf1, thread_local_data_x);
+      mv_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf1, thread_local_data_x);
+      do_conv_x_1row<false, TILE_SIZE>(rbuf1 + replace_y*TILE_SIZE, rbuf0);
+      do_conv_x_1row<true, TILE_SIZE>(rbuf1_sq + replace_y*TILE_SIZE, rbuf0);
+
+      __pipeline_wait_prior(0);
+      mv_data_1d<RBUF_SIZE>(rbuf0, sbuf2, thread_local_data_x);
+      mv_mul_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf2, thread_local_data_x);
+      do_conv_x_1row<false, TILE_SIZE>(rbuf2 + replace_y*TILE_SIZE, rbuf0);
+      do_conv_x_1row<true, TILE_SIZE>(rbuf2_sq + replace_y*TILE_SIZE, rbuf0);
+      do_conv_x_1row<false, TILE_SIZE>(rbuf3 + replace_y*TILE_SIZE, rbuf0_mul);
+    }
+  }
+}
+
+/*
 __global__ void fusedssimCUDA(
   int H,
   int W,
@@ -338,7 +618,7 @@ __global__ void fusedssimCUDA(
     }
   }
 }
-
+*/
 __global__ void fusedssim_backwardCUDA(
   int H,
   int W,
@@ -435,7 +715,10 @@ fusedssim_opt(
   int W = img1.size(3);
   dim3 grid((W + BX - 1) / BX, (H + BY - 1) / BY, CH);
   // dim3 block(BX, BY, 1);
-  dim3 block(WARP_SIZE, WARP_NUM, 1);
+  dim3 block(WARP_SIZE);
+  printf("B: %d, CH: %d, H: %d, W: %d\n", B, CH, H, W);
+  printf("grid: %d %d %d\n", grid.x, grid.y, grid.z);
+  printf("block: %d %d %d\n", block.x, block.y, block.z);
 
   torch::Tensor target = torch::zeros_like(img1).contiguous();
   torch::Tensor dm_dmu1 = train ? torch::zeros_like(img1).contiguous() : torch::empty(0);
