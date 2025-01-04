@@ -2,6 +2,8 @@
 
 Picture Size: [1, 3, 2160, 3840]
 
+Platform: A100-80GB
+
 | Version | Duration [ms] | Speedup | Percentage |
 | :-----: | :-----------: | :-----: | :--------: |
 |  Naive  |     2.40      |    0    |     0%     |
