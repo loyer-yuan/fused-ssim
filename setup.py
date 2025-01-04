@@ -3,6 +3,12 @@ from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
 NVCC_FLAGS = [
     "-lineinfo",
+    "-Xptxas",
+    "-Werror",
+    "-Xptxas",
+    "-warn-lmem-usage",
+    "-Xptxas",
+    "-warn-spills",
 ]
 
 CXX_FLAGS = [

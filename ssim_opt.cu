@@ -5,12 +5,6 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_pipeline.h>
 
-namespace cg = cooperative_groups;
-
-#define DEBUG_CON1 (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
-#define DEBUG_CON2 (blockIdx.x == (gridDim.x-1) && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 31)
-#define DEBUG_CON3 (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 3)
-#define DEBUG_CON DEBUG_CON3
 
 #define G_00 0.001028380123898387f
 #define G_01 0.0075987582094967365f
@@ -29,8 +23,7 @@ namespace cg = cooperative_groups;
 
 #define WINDOW_SIZE 11
 #define SLIDING_STEPS 1
-// #define SLIDING_TIMES (8*9)
-#define SLIDING_TIMES 32
+#define SLIDING_TIMES (8*9)
 #define SLIDING_LEN (SLIDING_TIMES * SLIDING_STEPS)
 
 // #define TILE_SIZE 4
@@ -53,54 +46,6 @@ namespace cg = cooperative_groups;
 
 
 /**
- * Get pixel value from image
- * 
- * @param img Image tensor
- * @param b Batch index
- * @param c Channel index
- * @param y Y coordinate
- * @param x X coordinate
- * @param CH Number of channels
- * @param H Height of image
- * @param W Width of image
- */
-/*
-__device__ __forceinline__ float get_pix_value(const float* img, const int b, const int c, const int y, const int x, const int CH, const int H, const int W) {
-  if (x >= W || y >= H || x < 0 || y < 0) {
-    return 0.0f;
-  } else {
-    return img[b * CH * H * W + c * H * W + y * W + x];
-  }
-}
-*/
-
-/*
-// TODO: Use float4 for loading 4 pixels at once
-// TODO: Use async copy for loading pixels
-__device__ void load_into_shared(float * __restrict__ pixels, const float * __restrict__ inp, const int CH, const int H, const int W, const int i) {
-  auto block = cg::this_thread_block();
-  const int batch = 0;
-  const int start_y = block.group_index().y * BY;
-  const int start_x = block.group_index().x * BX;
-
-  const int cnt = SY * SX;
-  const int thread_num = WARP_NUM * WARP_SIZE;
-  const int num_blocks = (cnt + thread_num - 1) / (thread_num);
-  for (int b = 0; b < num_blocks; ++b) {
-    int tid = b * (thread_num) + block.thread_rank();
-    if (tid < cnt) {
-      int local_y = tid / SX;
-      int local_x = tid % SX;
-      int y = start_y + local_y;
-      int x = start_x + local_x;
-      float one = get_pix_value(inp, batch, i, y - 5, x - 5, CH, H, W);
-      pixels[local_y*SX + local_x] = one;
-    }
-  }
-}
-*/
-
-/**
  * @brief Load pixels into shared memory asynchronously with only one warp.
  */
 template<int len>
@@ -112,184 +57,71 @@ __device__ inline void ld1row_into_shared_async(float * __restrict__ s_row_pixel
     const int cur_x = warp_start_x + i;
     const int cur_y = warp_start_y;
     const int fillzero = fillzero_y || (cur_x < 0 || cur_x >= W);
-    if (fillzero) {
-      s_row_pixels[i] = 0.0f;
-    } else {
-      __pipeline_memcpy_async(s_row_pixels + i, d_images + blockIdx.z * H * W + cur_y * W + cur_x, sizeof(float));
-    }
-    // __pipeline_memcpy_async(s_row_pixels + i, d_images + blockIdx.z * H * W + cur_y * W + cur_x, sizeof(float)), fillzero;
+    // if (fillzero) {
+    //   s_row_pixels[i] = 0.0f;
+    // } else {
+    //   __pipeline_memcpy_async(s_row_pixels + i, d_images + blockIdx.z * H * W + cur_y * W + cur_x, sizeof(float));
+    // }
+    __pipeline_memcpy_async(s_row_pixels + i, d_images + blockIdx.z * H * W + cur_y * W + cur_x, sizeof(float), fillzero);
   }
   __pipeline_commit();
 }
 
-/*
-__device__ void multiply_shared_mem(float * __restrict__ pix1, const float * __restrict__ pix2) {
-  auto block = cg::this_thread_block();
-  const int cnt = SY * SX;
-  const int thread_num = WARP_NUM * WARP_SIZE;
-  const int num_blocks = (cnt + thread_num - 1) / (thread_num);
-  for (int b = 0; b < num_blocks; ++b) {
-    int tid = b * (thread_num) + block.thread_rank();
-    if (tid < cnt) {
-      int local_y = tid / SX;
-      int local_x = tid % SX;
-      float one = pix1[local_y*SX + local_x];
-      float two = pix2[local_y*SX + local_x];
-      pix1[local_y*SX + local_x] = one * two;
-    }
-  }
-}
-*/
 
-/*
-__device__ void
-flush_conv_scratch(float buf[CY][CX]) {
-  auto block = cg::this_thread_block();
-  const int cnt = CY * CX;
-  const int thread_num = WARP_NUM * WARP_SIZE;
-  const int num_blocks = (cnt + thread_num - 1) / (thread_num);
-  for (int b = 0; b < num_blocks; ++b) {
-    const int tid = b * (thread_num) + block.thread_rank();
-    if (tid < cnt) {
-      const int local_y = tid / CX;
-      const int local_x = tid % CX;
-      buf[local_y][local_x] = 0.0f;
-    }
-  }
-}
-*/
 __device__ __forceinline__ float do_sq(float val) {
   return val * val;
 }
 
-template<int width, bool do_width, bool sq>
-__device__ __forceinline__ float do_conv(const float * __restrict__ pixels, int h, int w) {
-  float val = 0.0f;
-  // calculate along width/x dimension
-  if constexpr (do_width) {
-    if constexpr (sq) {
-      val += G_00 * do_sq(pixels[h*width + w - 5]);
-      val += G_01 * do_sq(pixels[h*width + w - 4]);
-      val += G_02 * do_sq(pixels[h*width + w - 3]);
-      val += G_03 * do_sq(pixels[h*width + w - 2]);
-      val += G_04 * do_sq(pixels[h*width + w - 1]);
-      val += G_05 * do_sq(pixels[h*width + w    ]);
-      val += G_06 * do_sq(pixels[h*width + w + 1]);
-      val += G_07 * do_sq(pixels[h*width + w + 2]);
-      val += G_08 * do_sq(pixels[h*width + w + 3]);
-      val += G_09 * do_sq(pixels[h*width + w + 4]);
-      val += G_10 * do_sq(pixels[h*width + w + 5]);
-    } else {
-      val += G_00 * pixels[h*width + w - 5];
-      val += G_01 * pixels[h*width + w - 4];
-      val += G_02 * pixels[h*width + w - 3];
-      val += G_03 * pixels[h*width + w - 2];
-      val += G_04 * pixels[h*width + w - 1];
-      val += G_05 * pixels[h*width + w    ];
-      val += G_06 * pixels[h*width + w + 1];
-      val += G_07 * pixels[h*width + w + 2];
-      val += G_08 * pixels[h*width + w + 3];
-      val += G_09 * pixels[h*width + w + 4];
-      val += G_10 * pixels[h*width + w + 5];
-    }
-  } else {
-    if constexpr (sq) {
-      val += G_00 * do_sq(pixels[(h - 5)*width + w]);
-      val += G_01 * do_sq(pixels[(h - 4)*width + w]);
-      val += G_02 * do_sq(pixels[(h - 3)*width + w]);
-      val += G_03 * do_sq(pixels[(h - 2)*width + w]);
-      val += G_04 * do_sq(pixels[(h - 1)*width + w]);
-      val += G_05 * do_sq(pixels[(h    )*width + w]);
-      val += G_06 * do_sq(pixels[(h + 1)*width + w]);
-      val += G_07 * do_sq(pixels[(h + 2)*width + w]);
-      val += G_08 * do_sq(pixels[(h + 3)*width + w]);
-      val += G_09 * do_sq(pixels[(h + 4)*width + w]);
-      val += G_10 * do_sq(pixels[(h + 5)*width + w]);
-    } else {
-      val += G_00 * pixels[(h - 5)*width + w];
-      val += G_01 * pixels[(h - 4)*width + w];
-      val += G_02 * pixels[(h - 3)*width + w];
-      val += G_03 * pixels[(h - 2)*width + w];
-      val += G_04 * pixels[(h - 1)*width + w];
-      val += G_05 * pixels[(h    )*width + w];
-      val += G_06 * pixels[(h + 1)*width + w];
-      val += G_07 * pixels[(h + 2)*width + w];
-      val += G_08 * pixels[(h + 3)*width + w];
-      val += G_09 * pixels[(h + 4)*width + w];
-      val += G_10 * pixels[(h + 5)*width + w];
-    }
-  }
-  return val;
-}
 
 template<bool sq>
 __device__ __forceinline__ float do_conv_x(const float * __restrict__ pixels, int w) {
   float val = 0.0f;
   // calculate along width/x dimension
   if constexpr (sq) {
-    val += G_00 * do_sq(pixels[w - 5]);
-    val += G_01 * do_sq(pixels[w - 4]);
-    val += G_02 * do_sq(pixels[w - 3]);
-    val += G_03 * do_sq(pixels[w - 2]);
-    val += G_04 * do_sq(pixels[w - 1]);
-    val += G_05 * do_sq(pixels[w    ]);
-    val += G_06 * do_sq(pixels[w + 1]);
-    val += G_07 * do_sq(pixels[w + 2]);
-    val += G_08 * do_sq(pixels[w + 3]);
-    val += G_09 * do_sq(pixels[w + 4]);
-    val += G_10 * do_sq(pixels[w + 5]);
+    val += G_00 * do_sq(pixels[w +  0]);
+    val += G_01 * do_sq(pixels[w +  1]);
+    val += G_02 * do_sq(pixels[w +  2]);
+    val += G_03 * do_sq(pixels[w +  3]);
+    val += G_04 * do_sq(pixels[w +  4]);
+    val += G_05 * do_sq(pixels[w +  5]);
+    val += G_06 * do_sq(pixels[w +  6]);
+    val += G_07 * do_sq(pixels[w +  7]);
+    val += G_08 * do_sq(pixels[w +  8]);
+    val += G_09 * do_sq(pixels[w +  9]);
+    val += G_10 * do_sq(pixels[w + 10]);
   } else {
-    val += G_00 * pixels[w - 5];
-    val += G_01 * pixels[w - 4];
-    val += G_02 * pixels[w - 3];
-    val += G_03 * pixels[w - 2];
-    val += G_04 * pixels[w - 1];
-    val += G_05 * pixels[w    ];
-    val += G_06 * pixels[w + 1];
-    val += G_07 * pixels[w + 2];
-    val += G_08 * pixels[w + 3];
-    val += G_09 * pixels[w + 4];
-    val += G_10 * pixels[w + 5];
-    }
+    val += G_00 * pixels[w +  0];
+    val += G_01 * pixels[w +  1];
+    val += G_02 * pixels[w +  2];
+    val += G_03 * pixels[w +  3];
+    val += G_04 * pixels[w +  4];
+    val += G_05 * pixels[w +  5];
+    val += G_06 * pixels[w +  6];
+    val += G_07 * pixels[w +  7];
+    val += G_08 * pixels[w +  8];
+    val += G_09 * pixels[w +  9];
+    val += G_10 * pixels[w + 10];
+  }
   return val;
 }
 
-template<int width>
-__device__ __forceinline__ float do_conv_y(const float * __restrict__ pixels, const int start_h, const int w) {
+
+__device__ __forceinline__ float do_conv_y(const float &v00, const float &v01, const float &v02, const float &v03, const float &v04, const float &v05, const float &v06, const float &v07, const float &v08, const float &v09, const float &v10) {
   float val = 0.0f;
-  val += G_00 * pixels[((start_h +  0) % WINDOW_SIZE)*width + w];
-  val += G_01 * pixels[((start_h +  1) % WINDOW_SIZE)*width + w];
-  val += G_02 * pixels[((start_h +  2) % WINDOW_SIZE)*width + w];
-  val += G_03 * pixels[((start_h +  3) % WINDOW_SIZE)*width + w];
-  val += G_04 * pixels[((start_h +  4) % WINDOW_SIZE)*width + w];
-  val += G_05 * pixels[((start_h +  5) % WINDOW_SIZE)*width + w];
-  val += G_06 * pixels[((start_h +  6) % WINDOW_SIZE)*width + w];
-  val += G_07 * pixels[((start_h +  7) % WINDOW_SIZE)*width + w];
-  val += G_08 * pixels[((start_h +  8) % WINDOW_SIZE)*width + w];
-  val += G_09 * pixels[((start_h +  9) % WINDOW_SIZE)*width + w];
-  val += G_10 * pixels[((start_h + 10) % WINDOW_SIZE)*width + w];
+  val += G_00 * v00;
+  val += G_01 * v01;
+  val += G_02 * v02;
+  val += G_03 * v03;
+  val += G_04 * v04;
+  val += G_05 * v05;
+  val += G_06 * v06;
+  val += G_07 * v07;
+  val += G_08 * v08;
+  val += G_09 * v09;
+  val += G_10 * v10;
   return val;
 }
 
-/*
-template<int len, int width>
-__device__ inline void load_into_reg(float * __restrict__ buf, const float * __restrict__ pixels, int h, int w) {
-  #pragma unroll
-  for (int i = 0; i < len; ++i) {
-    buf[i] = pixels[h*width + w + i];
-  }
-}
-*/
-
-/*
-template<int len, int dest_width, int src_width>
-__device__ inline void mv_data_2d(float * __restrict__ dest, const float * __restrict__ src, int dest_y, int dest_x, int src_y, int src_x) {
-  #pragma unroll
-  for (int i = 0; i < len; ++i) {
-    dest[dest_y*dest_width + dest_x + i] = src[src_y*src_width + src_x + i];
-  }
-}
-*/
 
 template<int len>
 __device__ inline void mv_data_1d(float * __restrict__ dest, const float * __restrict__ src, int offset_x) {
@@ -300,6 +132,7 @@ __device__ inline void mv_data_1d(float * __restrict__ dest, const float * __res
   }
 }
 
+
 template<int len>
 __device__ inline void mv_mul_data_1d(float * __restrict__ dest, const float * __restrict__ src, int offset_x) {
   #pragma unroll
@@ -308,61 +141,148 @@ __device__ inline void mv_mul_data_1d(float * __restrict__ dest, const float * _
   }
 }
 
-template<int sq, int tile_size>
-__device__ inline void do_conv_x_1row(float * __restrict__ dest, const float * __restrict__ src) {
-  #pragma unroll
-  for (int i = 0; i < tile_size; ++i) {
-    dest[i] = do_conv_x<sq>(src, i+5);
+
+template<bool isLoad>
+__device__ inline void stage_0_load_data_x_conv(
+  float &rbuf1_0, float &rbuf1_1,
+  float &rbuf1_sq_0, float &rbuf1_sq_1,
+  float &rbuf2_0, float &rbuf2_1,
+  float &rbuf2_sq_0, float &rbuf2_sq_1,
+  float &rbuf3_0, float &rbuf3_1,
+  float * __restrict__ rbuf0,
+  float * __restrict__ rbuf0_mul,
+  float * __restrict__ sbuf1,
+  float * __restrict__ sbuf2,
+  float const * __restrict__ img1,
+  float const * __restrict__ img2,
+  int CH, int H, int W,
+  int block_data_x, int block_data_y, int thread_local_data_x, int i
+) {
+  // load data of img1
+  __pipeline_wait_prior(1);
+  mv_data_1d<RBUF_SIZE>(rbuf0, sbuf1, thread_local_data_x);
+  mv_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf1, thread_local_data_x);
+  if constexpr (isLoad) {
+    ld1row_into_shared_async<SX>(sbuf1, img1, CH, H, W, block_data_x-5, block_data_y-5+i+1); // load i+1 data
   }
+  // do convolution of rbuf1
+  rbuf1_0 = do_conv_x<false>(rbuf0, 0);
+  rbuf1_1 = do_conv_x<false>(rbuf0, 1);
+  // do convolution of rbuf1_sq
+  rbuf1_sq_0 = do_conv_x<true>(rbuf0, 0);
+  rbuf1_sq_1 = do_conv_x<true>(rbuf0, 1);
+
+  // load data of img2
+  __pipeline_wait_prior(1);
+  mv_data_1d<RBUF_SIZE>(rbuf0, sbuf2, thread_local_data_x);
+  mv_mul_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf2, thread_local_data_x);
+  if constexpr (isLoad) {
+    ld1row_into_shared_async<SX>(sbuf2, img2, CH, H, W, block_data_x-5, block_data_y-5+i+1);  // load i+1 data
+  }
+  // do convolution of rbuf2
+  rbuf2_0 = do_conv_x<false>(rbuf0, 0);
+  rbuf2_1 = do_conv_x<false>(rbuf0, 1);
+  // do convolution of rbuf2_sq
+  rbuf2_sq_0 = do_conv_x<true>(rbuf0, 0);
+  rbuf2_sq_1 = do_conv_x<true>(rbuf0, 1);
+  // do convolution of rbuf3
+  rbuf3_0 = do_conv_x<false>(rbuf0_mul, 0);
+  rbuf3_1 = do_conv_x<false>(rbuf0_mul, 1);
 }
 
-template<int tile_size>
-__device__ inline void do_conv_y_col(float * __restrict__ dest, const float * __restrict__ src, const int start_y = 0) {
-  #pragma unroll
-  for (int i = 0; i < tile_size; ++i) {
-    dest[i] = do_conv_y<tile_size>(src, start_y, i);
-  }
+
+__device__ inline void stage_1_y_conv(
+  const float &rbuf1_0_00, const float &rbuf1_1_00, const float &rbuf1_sq_0_00, const float &rbuf1_sq_1_00, const float &rbuf2_0_00, const float &rbuf2_1_00, const float &rbuf2_sq_0_00, const float &rbuf2_sq_1_00, const float &rbuf3_0_00, const float &rbuf3_1_00,
+  const float &rbuf1_0_01, const float &rbuf1_1_01, const float &rbuf1_sq_0_01, const float &rbuf1_sq_1_01, const float &rbuf2_0_01, const float &rbuf2_1_01, const float &rbuf2_sq_0_01, const float &rbuf2_sq_1_01, const float &rbuf3_0_01, const float &rbuf3_1_01,
+  const float &rbuf1_0_02, const float &rbuf1_1_02, const float &rbuf1_sq_0_02, const float &rbuf1_sq_1_02, const float &rbuf2_0_02, const float &rbuf2_1_02, const float &rbuf2_sq_0_02, const float &rbuf2_sq_1_02, const float &rbuf3_0_02, const float &rbuf3_1_02,
+  const float &rbuf1_0_03, const float &rbuf1_1_03, const float &rbuf1_sq_0_03, const float &rbuf1_sq_1_03, const float &rbuf2_0_03, const float &rbuf2_1_03, const float &rbuf2_sq_0_03, const float &rbuf2_sq_1_03, const float &rbuf3_0_03, const float &rbuf3_1_03,
+  const float &rbuf1_0_04, const float &rbuf1_1_04, const float &rbuf1_sq_0_04, const float &rbuf1_sq_1_04, const float &rbuf2_0_04, const float &rbuf2_1_04, const float &rbuf2_sq_0_04, const float &rbuf2_sq_1_04, const float &rbuf3_0_04, const float &rbuf3_1_04,
+  const float &rbuf1_0_05, const float &rbuf1_1_05, const float &rbuf1_sq_0_05, const float &rbuf1_sq_1_05, const float &rbuf2_0_05, const float &rbuf2_1_05, const float &rbuf2_sq_0_05, const float &rbuf2_sq_1_05, const float &rbuf3_0_05, const float &rbuf3_1_05,
+  const float &rbuf1_0_06, const float &rbuf1_1_06, const float &rbuf1_sq_0_06, const float &rbuf1_sq_1_06, const float &rbuf2_0_06, const float &rbuf2_1_06, const float &rbuf2_sq_0_06, const float &rbuf2_sq_1_06, const float &rbuf3_0_06, const float &rbuf3_1_06,
+  const float &rbuf1_0_07, const float &rbuf1_1_07, const float &rbuf1_sq_0_07, const float &rbuf1_sq_1_07, const float &rbuf2_0_07, const float &rbuf2_1_07, const float &rbuf2_sq_0_07, const float &rbuf2_sq_1_07, const float &rbuf3_0_07, const float &rbuf3_1_07,
+  const float &rbuf1_0_08, const float &rbuf1_1_08, const float &rbuf1_sq_0_08, const float &rbuf1_sq_1_08, const float &rbuf2_0_08, const float &rbuf2_1_08, const float &rbuf2_sq_0_08, const float &rbuf2_sq_1_08, const float &rbuf3_0_08, const float &rbuf3_1_08,
+  const float &rbuf1_0_09, const float &rbuf1_1_09, const float &rbuf1_sq_0_09, const float &rbuf1_sq_1_09, const float &rbuf2_0_09, const float &rbuf2_1_09, const float &rbuf2_sq_0_09, const float &rbuf2_sq_1_09, const float &rbuf3_0_09, const float &rbuf3_1_09,
+  const float &rbuf1_0_10, const float &rbuf1_1_10, const float &rbuf1_sq_0_10, const float &rbuf1_sq_1_10, const float &rbuf2_0_10, const float &rbuf2_1_10, const float &rbuf2_sq_0_10, const float &rbuf2_sq_1_10, const float &rbuf3_0_10, const float &rbuf3_1_10,
+  float * __restrict__ mu1_arr,
+  float * __restrict__ sigma1_sq_arr,
+  float * __restrict__ mu2_arr,
+  float * __restrict__ sigma2_sq_arr,
+  float * __restrict__ sigma12_arr
+) {
+  // do convolution of mu1arr
+  mu1_arr[0] = do_conv_y(rbuf1_0_00, rbuf1_0_01, rbuf1_0_02, rbuf1_0_03, rbuf1_0_04, rbuf1_0_05, rbuf1_0_06, rbuf1_0_07, rbuf1_0_08, rbuf1_0_09, rbuf1_0_10);
+  mu1_arr[1] = do_conv_y(rbuf1_1_00, rbuf1_1_01, rbuf1_1_02, rbuf1_1_03, rbuf1_1_04, rbuf1_1_05, rbuf1_1_06, rbuf1_1_07, rbuf1_1_08, rbuf1_1_09, rbuf1_1_10);
+  // do convolution of sigma1_sq_arr
+  sigma1_sq_arr[0] = do_conv_y(rbuf1_sq_0_00, rbuf1_sq_0_01, rbuf1_sq_0_02, rbuf1_sq_0_03, rbuf1_sq_0_04, rbuf1_sq_0_05, rbuf1_sq_0_06, rbuf1_sq_0_07, rbuf1_sq_0_08, rbuf1_sq_0_09, rbuf1_sq_0_10);
+  sigma1_sq_arr[0] -= do_sq(mu1_arr[0]);
+  sigma1_sq_arr[1] = do_conv_y(rbuf1_sq_1_00, rbuf1_sq_1_01, rbuf1_sq_1_02, rbuf1_sq_1_03, rbuf1_sq_1_04, rbuf1_sq_1_05, rbuf1_sq_1_06, rbuf1_sq_1_07, rbuf1_sq_1_08, rbuf1_sq_1_09, rbuf1_sq_1_10);
+  sigma1_sq_arr[1] -= do_sq(mu1_arr[1]);
+  // do convolution of mu2_arr
+  mu2_arr[0] = do_conv_y(rbuf2_0_00, rbuf2_0_01, rbuf2_0_02, rbuf2_0_03, rbuf2_0_04, rbuf2_0_05, rbuf2_0_06, rbuf2_0_07, rbuf2_0_08, rbuf2_0_09, rbuf2_0_10);
+  mu2_arr[1] = do_conv_y(rbuf2_1_00, rbuf2_1_01, rbuf2_1_02, rbuf2_1_03, rbuf2_1_04, rbuf2_1_05, rbuf2_1_06, rbuf2_1_07, rbuf2_1_08, rbuf2_1_09, rbuf2_1_10);
+  // do convolution of sigma2_sq_arr
+  sigma2_sq_arr[0] = do_conv_y(rbuf2_sq_0_00, rbuf2_sq_0_01, rbuf2_sq_0_02, rbuf2_sq_0_03, rbuf2_sq_0_04, rbuf2_sq_0_05, rbuf2_sq_0_06, rbuf2_sq_0_07, rbuf2_sq_0_08, rbuf2_sq_0_09, rbuf2_sq_0_10);
+  sigma2_sq_arr[0] -= do_sq(mu2_arr[0]);
+  sigma2_sq_arr[1] = do_conv_y(rbuf2_sq_1_00, rbuf2_sq_1_01, rbuf2_sq_1_02, rbuf2_sq_1_03, rbuf2_sq_1_04, rbuf2_sq_1_05, rbuf2_sq_1_06, rbuf2_sq_1_07, rbuf2_sq_1_08, rbuf2_sq_1_09, rbuf2_sq_1_10);
+  sigma2_sq_arr[1] -= do_sq(mu2_arr[1]);
+  // do convolution of sigma12_arr
+  sigma12_arr[0] = do_conv_y(rbuf3_0_00, rbuf3_0_01, rbuf3_0_02, rbuf3_0_03, rbuf3_0_04, rbuf3_0_05, rbuf3_0_06, rbuf3_0_07, rbuf3_0_08, rbuf3_0_09, rbuf3_0_10);
+  sigma12_arr[0] -= mu1_arr[0] * mu2_arr[0];
+  sigma12_arr[1] = do_conv_y(rbuf3_1_00, rbuf3_1_01, rbuf3_1_02, rbuf3_1_03, rbuf3_1_04, rbuf3_1_05, rbuf3_1_06, rbuf3_1_07, rbuf3_1_08, rbuf3_1_09, rbuf3_1_10);
+  sigma12_arr[1] -= mu1_arr[1] * mu2_arr[1];
 }
 
-/*
-template<bool sq>
-__device__ inline void do_separable_conv_x(const float * __restrict__ pixels, float * __restrict__ opt, float * __restrict__ buf) {
-  auto block = cg::this_thread_block();
+__device__ inline void stage_2_compute_ssim_store(
+  const float * __restrict__ mu1_arr, const float * __restrict__ sigma1_sq_arr, const float * __restrict__ mu2_arr, const float * __restrict__ sigma2_sq_arr, const float * __restrict__ sigma12_arr,
+  float * __restrict__ ssim_map, float * __restrict__ dm_dmu1, float * __restrict__ dm_dsigma1_sq, float * __restrict__ dm_dsigma12,
+  const float C1, const float C2, const int channel, const int H, const int W, const int block_data_x, const int block_data_y, const int thread_local_data_x, const int sliding_idx
+) {
+  #pragma unroll
+  for (int ii = 0; ii < TILE_SIZE; ii++) {
+    const int cur_x = block_data_x + thread_local_data_x + ii;
+    const int cur_y = block_data_y + sliding_idx;
+    if (cur_x < W && cur_y < H) {
+      const float mu1 = mu1_arr[ii];
+      const float mu2 = mu2_arr[ii];
+      const float sigma1_sq = sigma1_sq_arr[ii];
+      const float sigma2_sq = sigma2_sq_arr[ii];
+      const float sigma12 = sigma12_arr[ii];
 
-  int local_y = block.thread_index().y;
-  int local_x = block.thread_index().x * TILE_SIZE + 5;
+      const float C = (2.0f * mu1 * mu2 + C1);
+      const float D = (2.0f * sigma12 + C2);
+      const float A = (mu1 * mu1 + mu2 * mu2 + C1);
+      const float B = (sigma1_sq + sigma2_sq + C2);
+      const float m = (C * D) / (A * B);
 
-  do {
-    load_into_reg<RBUF_SIZE, SX>(buf, pixels, local_y, local_x - 5);
-
-    #pragma unroll
-    for (int i = 0; i < TILE_SIZE; ++i) {
-      opt[local_y*CX + (local_x-5) + i] = do_conv<0, true, sq>(buf, 0, i + 5);
+      const int global_idx = channel * H * W + cur_y * W + cur_x;
+      ssim_map[global_idx] = m;
+      if (dm_dmu1) {
+        dm_dmu1[global_idx] = (
+          (mu2 * 2.0f * D) / (A * B)
+          -(mu2 * 2.0f * C) / (A * B)
+          -(mu1 * 2.0f * C * D) / ( A * A * B)
+          +(mu1 * 2.0f * C * D) / (A * B * B)
+        );
+        dm_dsigma1_sq[global_idx] = ((-C * D) / (A * B * B));
+        dm_dsigma12[global_idx] = ((2 * C) / (A * B));
+      }
     }
-    local_y += BY;
-  } while (local_y < SY);
-}
-
-template<bool sq>
-__device__ inline void do_separable_conv_y(const float * __restrict__ pixels, float * __restrict__ output) {
-  auto block = cg::this_thread_block();
-  int local_y = block.thread_index().y + 5;
-  int local_x = block.thread_index().x * TILE_SIZE;
-
-  #pragma unroll
-  for (int i = 0; i < TILE_SIZE; ++i) {
-    output[i] = do_conv<CX, false, sq>(pixels, local_y, local_x + i);
   }
 }
-*/
 
-template<int len>
-__device__ __forceinline__ void do_elementwise_mul_sub(float * out, const float * f1, const float * f2) {
-  #pragma unroll
-  for (int i = 0; i < len; ++i) {
-    out[i] -= f1[i] * f2[i];
-  }
-}
+
+#define CONST_PARAMETERS rbuf0, rbuf0_mul, sbuf1, sbuf2, img1, img2, CH, H, W, block_data_x, block_data_y, thread_local_data_x
+#define REGS_00 rbuf1_0_00, rbuf1_1_00, rbuf1_sq_0_00, rbuf1_sq_1_00, rbuf2_0_00, rbuf2_1_00, rbuf2_sq_0_00, rbuf2_sq_1_00, rbuf3_0_00, rbuf3_1_00
+#define REGS_01 rbuf1_0_01, rbuf1_1_01, rbuf1_sq_0_01, rbuf1_sq_1_01, rbuf2_0_01, rbuf2_1_01, rbuf2_sq_0_01, rbuf2_sq_1_01, rbuf3_0_01, rbuf3_1_01
+#define REGS_02 rbuf1_0_02, rbuf1_1_02, rbuf1_sq_0_02, rbuf1_sq_1_02, rbuf2_0_02, rbuf2_1_02, rbuf2_sq_0_02, rbuf2_sq_1_02, rbuf3_0_02, rbuf3_1_02
+#define REGS_03 rbuf1_0_03, rbuf1_1_03, rbuf1_sq_0_03, rbuf1_sq_1_03, rbuf2_0_03, rbuf2_1_03, rbuf2_sq_0_03, rbuf2_sq_1_03, rbuf3_0_03, rbuf3_1_03
+#define REGS_04 rbuf1_0_04, rbuf1_1_04, rbuf1_sq_0_04, rbuf1_sq_1_04, rbuf2_0_04, rbuf2_1_04, rbuf2_sq_0_04, rbuf2_sq_1_04, rbuf3_0_04, rbuf3_1_04
+#define REGS_05 rbuf1_0_05, rbuf1_1_05, rbuf1_sq_0_05, rbuf1_sq_1_05, rbuf2_0_05, rbuf2_1_05, rbuf2_sq_0_05, rbuf2_sq_1_05, rbuf3_0_05, rbuf3_1_05
+#define REGS_06 rbuf1_0_06, rbuf1_1_06, rbuf1_sq_0_06, rbuf1_sq_1_06, rbuf2_0_06, rbuf2_1_06, rbuf2_sq_0_06, rbuf2_sq_1_06, rbuf3_0_06, rbuf3_1_06
+#define REGS_07 rbuf1_0_07, rbuf1_1_07, rbuf1_sq_0_07, rbuf1_sq_1_07, rbuf2_0_07, rbuf2_1_07, rbuf2_sq_0_07, rbuf2_sq_1_07, rbuf3_0_07, rbuf3_1_07
+#define REGS_08 rbuf1_0_08, rbuf1_1_08, rbuf1_sq_0_08, rbuf1_sq_1_08, rbuf2_0_08, rbuf2_1_08, rbuf2_sq_0_08, rbuf2_sq_1_08, rbuf3_0_08, rbuf3_1_08
+#define REGS_09 rbuf1_0_09, rbuf1_1_09, rbuf1_sq_0_09, rbuf1_sq_1_09, rbuf2_0_09, rbuf2_1_09, rbuf2_sq_0_09, rbuf2_sq_1_09, rbuf3_0_09, rbuf3_1_09
+#define REGS_10 rbuf1_0_10, rbuf1_1_10, rbuf1_sq_0_10, rbuf1_sq_1_10, rbuf2_0_10, rbuf2_1_10, rbuf2_sq_0_10, rbuf2_sq_1_10, rbuf3_0_10, rbuf3_1_10
 
 __global__ void fusedssimCUDA(
   int H,
@@ -388,11 +308,22 @@ __global__ void fusedssimCUDA(
   __shared__ float sbuf2[SX];
   float rbuf0[RBUF_SIZE];
   float rbuf0_mul[RBUF_SIZE];
-  float rbuf1[TILE_SIZE*WINDOW_SIZE];
-  float rbuf1_sq[TILE_SIZE*WINDOW_SIZE];
-  float rbuf2[TILE_SIZE*WINDOW_SIZE];
-  float rbuf2_sq[TILE_SIZE*WINDOW_SIZE];
-  float rbuf3[TILE_SIZE*WINDOW_SIZE];
+
+  // float rbuf1[TILE_SIZE*WINDOW_SIZE];
+  // float rbuf1_sq[TILE_SIZE*WINDOW_SIZE];
+  // float rbuf2[TILE_SIZE*WINDOW_SIZE];
+  // float rbuf2_sq[TILE_SIZE*WINDOW_SIZE];
+  // float rbuf3[TILE_SIZE*WINDOW_SIZE];
+  float rbuf1_0_00, rbuf1_0_01, rbuf1_0_02, rbuf1_0_03, rbuf1_0_04, rbuf1_0_05, rbuf1_0_06, rbuf1_0_07, rbuf1_0_08, rbuf1_0_09, rbuf1_0_10;
+  float rbuf1_1_00, rbuf1_1_01, rbuf1_1_02, rbuf1_1_03, rbuf1_1_04, rbuf1_1_05, rbuf1_1_06, rbuf1_1_07, rbuf1_1_08, rbuf1_1_09, rbuf1_1_10;
+  float rbuf1_sq_0_00, rbuf1_sq_0_01, rbuf1_sq_0_02, rbuf1_sq_0_03, rbuf1_sq_0_04, rbuf1_sq_0_05, rbuf1_sq_0_06, rbuf1_sq_0_07, rbuf1_sq_0_08, rbuf1_sq_0_09, rbuf1_sq_0_10;
+  float rbuf1_sq_1_00, rbuf1_sq_1_01, rbuf1_sq_1_02, rbuf1_sq_1_03, rbuf1_sq_1_04, rbuf1_sq_1_05, rbuf1_sq_1_06, rbuf1_sq_1_07, rbuf1_sq_1_08, rbuf1_sq_1_09, rbuf1_sq_1_10;
+  float rbuf2_0_00, rbuf2_0_01, rbuf2_0_02, rbuf2_0_03, rbuf2_0_04, rbuf2_0_05, rbuf2_0_06, rbuf2_0_07, rbuf2_0_08, rbuf2_0_09, rbuf2_0_10;
+  float rbuf2_1_00, rbuf2_1_01, rbuf2_1_02, rbuf2_1_03, rbuf2_1_04, rbuf2_1_05, rbuf2_1_06, rbuf2_1_07, rbuf2_1_08, rbuf2_1_09, rbuf2_1_10;
+  float rbuf2_sq_0_00, rbuf2_sq_0_01, rbuf2_sq_0_02, rbuf2_sq_0_03, rbuf2_sq_0_04, rbuf2_sq_0_05, rbuf2_sq_0_06, rbuf2_sq_0_07, rbuf2_sq_0_08, rbuf2_sq_0_09, rbuf2_sq_0_10;
+  float rbuf2_sq_1_00, rbuf2_sq_1_01, rbuf2_sq_1_02, rbuf2_sq_1_03, rbuf2_sq_1_04, rbuf2_sq_1_05, rbuf2_sq_1_06, rbuf2_sq_1_07, rbuf2_sq_1_08, rbuf2_sq_1_09, rbuf2_sq_1_10;
+  float rbuf3_0_00, rbuf3_0_01, rbuf3_0_02, rbuf3_0_03, rbuf3_0_04, rbuf3_0_05, rbuf3_0_06, rbuf3_0_07, rbuf3_0_08, rbuf3_0_09, rbuf3_0_10;
+  float rbuf3_1_00, rbuf3_1_01, rbuf3_1_02, rbuf3_1_03, rbuf3_1_04, rbuf3_1_05, rbuf3_1_06, rbuf3_1_07, rbuf3_1_08, rbuf3_1_09, rbuf3_1_10;
   
   float mu1_arr[TILE_SIZE];
   float sigma1_sq_arr[TILE_SIZE];
@@ -403,222 +334,222 @@ __global__ void fusedssimCUDA(
   // fulfill the pipeline
   ld1row_into_shared_async<SX>(sbuf1, img1, CH, H, W, block_data_x-5, block_data_y-5);
   ld1row_into_shared_async<SX>(sbuf2, img2, CH, H, W, block_data_x-5, block_data_y-5);
-  for (int i = 0; i < WINDOW_SIZE; ++i) {
-    __pipeline_wait_prior(1);
-    mv_data_1d<RBUF_SIZE>(rbuf0, sbuf1, thread_local_data_x);
-    mv_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf1, thread_local_data_x);
-    ld1row_into_shared_async<SX>(sbuf1, img1, CH, H, W, block_data_x-5, block_data_y-5+i+1); // load i+1 data
-    do_conv_x_1row<false, TILE_SIZE>(rbuf1 + i*TILE_SIZE, rbuf0);
-    do_conv_x_1row<true, TILE_SIZE>(rbuf1_sq + i*TILE_SIZE, rbuf0);
 
-    __pipeline_wait_prior(1);
-    mv_data_1d<RBUF_SIZE>(rbuf0, sbuf2, thread_local_data_x);
-    mv_mul_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf2, thread_local_data_x);
-    ld1row_into_shared_async<SX>(sbuf2, img2, CH, H, W, block_data_x-5, block_data_y-5+i+1);  // load i+1 data
-    do_conv_x_1row<false, TILE_SIZE>(rbuf2 + i*TILE_SIZE, rbuf0);
-    do_conv_x_1row<true, TILE_SIZE>(rbuf2_sq + i*TILE_SIZE, rbuf0);
-    do_conv_x_1row<false, TILE_SIZE>(rbuf3 + i*TILE_SIZE, rbuf0_mul);
-  }
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_00, rbuf1_1_00, rbuf1_sq_0_00, rbuf1_sq_1_00, rbuf2_0_00, rbuf2_1_00, rbuf2_sq_0_00, rbuf2_sq_1_00, rbuf3_0_00, rbuf3_1_00, 
+    CONST_PARAMETERS, 0
+  );
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_01, rbuf1_1_01, rbuf1_sq_0_01, rbuf1_sq_1_01, rbuf2_0_01, rbuf2_1_01, rbuf2_sq_0_01, rbuf2_sq_1_01, rbuf3_0_01, rbuf3_1_01, 
+    CONST_PARAMETERS, 1
+  );
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_02, rbuf1_1_02, rbuf1_sq_0_02, rbuf1_sq_1_02, rbuf2_0_02, rbuf2_1_02, rbuf2_sq_0_02, rbuf2_sq_1_02, rbuf3_0_02, rbuf3_1_02, 
+    CONST_PARAMETERS, 2
+  );
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_03, rbuf1_1_03, rbuf1_sq_0_03, rbuf1_sq_1_03, rbuf2_0_03, rbuf2_1_03, rbuf2_sq_0_03, rbuf2_sq_1_03, rbuf3_0_03, rbuf3_1_03, 
+    CONST_PARAMETERS, 3
+  );
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_04, rbuf1_1_04, rbuf1_sq_0_04, rbuf1_sq_1_04, rbuf2_0_04, rbuf2_1_04, rbuf2_sq_0_04, rbuf2_sq_1_04, rbuf3_0_04, rbuf3_1_04, 
+    CONST_PARAMETERS, 4
+  );
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_05, rbuf1_1_05, rbuf1_sq_0_05, rbuf1_sq_1_05, rbuf2_0_05, rbuf2_1_05, rbuf2_sq_0_05, rbuf2_sq_1_05, rbuf3_0_05, rbuf3_1_05, 
+    CONST_PARAMETERS, 5
+  );
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_06, rbuf1_1_06, rbuf1_sq_0_06, rbuf1_sq_1_06, rbuf2_0_06, rbuf2_1_06, rbuf2_sq_0_06, rbuf2_sq_1_06, rbuf3_0_06, rbuf3_1_06, 
+    CONST_PARAMETERS, 6
+  );
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_07, rbuf1_1_07, rbuf1_sq_0_07, rbuf1_sq_1_07, rbuf2_0_07, rbuf2_1_07, rbuf2_sq_0_07, rbuf2_sq_1_07, rbuf3_0_07, rbuf3_1_07, 
+    CONST_PARAMETERS, 7
+  );
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_08, rbuf1_1_08, rbuf1_sq_0_08, rbuf1_sq_1_08, rbuf2_0_08, rbuf2_1_08, rbuf2_sq_0_08, rbuf2_sq_1_08, rbuf3_0_08, rbuf3_1_08, 
+    CONST_PARAMETERS, 8
+  );
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_09, rbuf1_1_09, rbuf1_sq_0_09, rbuf1_sq_1_09, rbuf2_0_09, rbuf2_1_09, rbuf2_sq_0_09, rbuf2_sq_1_09, rbuf3_0_09, rbuf3_1_09, 
+    CONST_PARAMETERS, 9
+  );
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_10, rbuf1_1_10, rbuf1_sq_0_10, rbuf1_sq_1_10, rbuf2_0_10, rbuf2_1_10, rbuf2_sq_0_10, rbuf2_sq_1_10, rbuf3_0_10, rbuf3_1_10, 
+    CONST_PARAMETERS, 10
+  );
   
   // Sliding the window, wuhu!
-  for (int sliding_idx = 0; sliding_idx < SLIDING_TIMES; ++sliding_idx) {
-    int replace_y = sliding_idx % WINDOW_SIZE;
+  constexpr int UNROLL_TIMES = SLIDING_TIMES / WINDOW_SIZE;
+  constexpr int REST_TIMES = SLIDING_TIMES % WINDOW_SIZE;
+  int sliding_idx = 0;
+  for (int outer_idx = 0; outer_idx < UNROLL_TIMES; outer_idx++) {
+    stage_1_y_conv(REGS_00, REGS_01, REGS_02, REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_00, rbuf1_1_00, rbuf1_sq_0_00, rbuf1_sq_1_00, rbuf2_0_00, rbuf2_1_00, rbuf2_sq_0_00, rbuf2_sq_1_00, rbuf3_0_00, rbuf3_1_00, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
 
-    // stage 1-0: calculate y-dimensional convolution
-    do_conv_y_col<TILE_SIZE>(mu1_arr, rbuf1, replace_y); // mu1
-    do_conv_y_col<TILE_SIZE>(sigma1_sq_arr, rbuf1_sq, replace_y); // sigma1_sq
-    do_elementwise_mul_sub<TILE_SIZE>(sigma1_sq_arr, mu1_arr, mu1_arr);
-    do_conv_y_col<TILE_SIZE>(mu2_arr, rbuf2, replace_y); // mu2
-    do_conv_y_col<TILE_SIZE>(sigma2_sq_arr, rbuf2_sq, replace_y); // sigma2_sq
-    do_elementwise_mul_sub<TILE_SIZE>(sigma2_sq_arr, mu2_arr, mu2_arr);
-    do_conv_y_col<TILE_SIZE>(sigma12_arr, rbuf3, replace_y); // sigma12
-    do_elementwise_mul_sub<TILE_SIZE>(sigma12_arr, mu1_arr, mu2_arr);
-    
-    // stage 1-1: calculate SSIM
-    #pragma unroll
-    for (int ii = 0; ii < TILE_SIZE; ++ii) {
-      const float mu1 = mu1_arr[ii];
-      const float mu2 = mu2_arr[ii];
-      const float sigma1_sq = sigma1_sq_arr[ii];
-      const float sigma2_sq = sigma2_sq_arr[ii];
-      const float sigma12 = sigma12_arr[ii];
+    stage_1_y_conv(REGS_01, REGS_02, REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_01, rbuf1_1_01, rbuf1_sq_0_01, rbuf1_sq_1_01, rbuf2_0_01, rbuf2_1_01, rbuf2_sq_0_01, rbuf2_sq_1_01, rbuf3_0_01, rbuf3_1_01, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
 
-      const float mu1_sq = mu1 * mu1;
-      const float mu2_sq = mu2 * mu2;
-      const float mu1_mu2 = mu1 * mu2;
-      const float C = (2.0f * mu1_mu2 + C1);
-      const float D = (2.0f * sigma12 + C2);
-      const float A = (mu1_sq + mu2_sq + C1);
-      const float B = (sigma1_sq + sigma2_sq + C2);
-      const float m = (C * D) / (A * B);
+    stage_1_y_conv(REGS_02, REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_02, rbuf1_1_02, rbuf1_sq_0_02, rbuf1_sq_1_02, rbuf2_0_02, rbuf2_1_02, rbuf2_sq_0_02, rbuf2_sq_1_02, rbuf3_0_02, rbuf3_1_02, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
 
-      const int pix_x = block_data_x + thread_local_data_x + ii;
-      const int pix_y = block_data_y + sliding_idx;
-      if (pix_x < W && pix_y < H) {
-        const int global_idx = channel * H * W + pix_y * W + pix_x;
-        ssim_map[global_idx] = m;
-        if (dm_dmu1) {
-          dm_dmu1[global_idx] = (
-            (mu2 * 2.0f * D) / (A * B)
-            -(mu2 * 2.0f * C) / (A * B)
-            -(mu1 * 2.0f * C * D) / ( A * A * B)
-            +(mu1 * 2.0f * C * D) / (A * B * B)
-          );
-          dm_dsigma1_sq[global_idx] = ((-C * D) / (A * B * B));
-          dm_dsigma12[global_idx] = ((2 * C) / (A * B));
-        }
-      }
-    }
+    stage_1_y_conv(REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, REGS_02, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_03, rbuf1_1_03, rbuf1_sq_0_03, rbuf1_sq_1_03, rbuf2_0_03, rbuf2_1_03, rbuf2_sq_0_03, rbuf2_sq_1_03, rbuf3_0_03, rbuf3_1_03, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
 
-    // stage 0: load new data
-    if (sliding_idx+2 < SLIDING_TIMES) {
-      const int ldg_y = block_data_y+5 + sliding_idx+2;
-      // load sliding_idx + 1 row's data
-      __pipeline_wait_prior(1);
-      mv_data_1d<RBUF_SIZE>(rbuf0, sbuf1, thread_local_data_x);
-      mv_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf1, thread_local_data_x);
-      // load sliding_idx + 2 row's data
-      ld1row_into_shared_async<SX>(sbuf1, img1, CH, H, W, block_data_x-5, ldg_y);
-      do_conv_x_1row<false, TILE_SIZE>(rbuf1 + replace_y*TILE_SIZE, rbuf0);
-      do_conv_x_1row<true, TILE_SIZE>(rbuf1_sq + replace_y*TILE_SIZE, rbuf0);
+    stage_1_y_conv(REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, REGS_02, REGS_03, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_04, rbuf1_1_04, rbuf1_sq_0_04, rbuf1_sq_1_04, rbuf2_0_04, rbuf2_1_04, rbuf2_sq_0_04, rbuf2_sq_1_04, rbuf3_0_04, rbuf3_1_04, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
 
-      __pipeline_wait_prior(1);
-      mv_data_1d<RBUF_SIZE>(rbuf0, sbuf2, thread_local_data_x);
-      mv_mul_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf2, thread_local_data_x);
-      ld1row_into_shared_async<SX>(sbuf2, img2, CH, H, W, block_data_x-5, ldg_y);
-      do_conv_x_1row<false, TILE_SIZE>(rbuf2 + replace_y*TILE_SIZE, rbuf0);
-      do_conv_x_1row<true, TILE_SIZE>(rbuf2_sq + replace_y*TILE_SIZE, rbuf0);
-      do_conv_x_1row<false, TILE_SIZE>(rbuf3 + replace_y*TILE_SIZE, rbuf0_mul);
-    } else if (sliding_idx+1 == SLIDING_TIMES-1) { // load the last row
-      // load sliding_idx + 1 row's data
-      __pipeline_wait_prior(1);
-      mv_data_1d<RBUF_SIZE>(rbuf0, sbuf1, thread_local_data_x);
-      mv_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf1, thread_local_data_x);
-      do_conv_x_1row<false, TILE_SIZE>(rbuf1 + replace_y*TILE_SIZE, rbuf0);
-      do_conv_x_1row<true, TILE_SIZE>(rbuf1_sq + replace_y*TILE_SIZE, rbuf0);
+    stage_1_y_conv(REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, REGS_02, REGS_03, REGS_04, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_05, rbuf1_1_05, rbuf1_sq_0_05, rbuf1_sq_1_05, rbuf2_0_05, rbuf2_1_05, rbuf2_sq_0_05, rbuf2_sq_1_05, rbuf3_0_05, rbuf3_1_05, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
 
-      __pipeline_wait_prior(0);
-      mv_data_1d<RBUF_SIZE>(rbuf0, sbuf2, thread_local_data_x);
-      mv_mul_data_1d<RBUF_SIZE>(rbuf0_mul, sbuf2, thread_local_data_x);
-      do_conv_x_1row<false, TILE_SIZE>(rbuf2 + replace_y*TILE_SIZE, rbuf0);
-      do_conv_x_1row<true, TILE_SIZE>(rbuf2_sq + replace_y*TILE_SIZE, rbuf0);
-      do_conv_x_1row<false, TILE_SIZE>(rbuf3 + replace_y*TILE_SIZE, rbuf0_mul);
-    }
+    stage_1_y_conv(REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, REGS_02, REGS_03, REGS_04, REGS_05, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_06, rbuf1_1_06, rbuf1_sq_0_06, rbuf1_sq_1_06, rbuf2_0_06, rbuf2_1_06, rbuf2_sq_0_06, rbuf2_sq_1_06, rbuf3_0_06, rbuf3_1_06, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
+
+    stage_1_y_conv(REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, REGS_02, REGS_03, REGS_04, REGS_05, REGS_06, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_07, rbuf1_1_07, rbuf1_sq_0_07, rbuf1_sq_1_07, rbuf2_0_07, rbuf2_1_07, rbuf2_sq_0_07, rbuf2_sq_1_07, rbuf3_0_07, rbuf3_1_07, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
+
+    stage_1_y_conv(REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, REGS_02, REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_08, rbuf1_1_08, rbuf1_sq_0_08, rbuf1_sq_1_08, rbuf2_0_08, rbuf2_1_08, rbuf2_sq_0_08, rbuf2_sq_1_08, rbuf3_0_08, rbuf3_1_08, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
+
+    stage_1_y_conv(REGS_09, REGS_10, REGS_00, REGS_01, REGS_02, REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_09, rbuf1_1_09, rbuf1_sq_0_09, rbuf1_sq_1_09, rbuf2_0_09, rbuf2_1_09, rbuf2_sq_0_09, rbuf2_sq_1_09, rbuf3_0_09, rbuf3_1_09, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
+
+    stage_1_y_conv(REGS_10, REGS_00, REGS_01, REGS_02, REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+    stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+      ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+      sliding_idx);
+    stage_0_load_data_x_conv<true>(
+      rbuf1_0_10, rbuf1_1_10, rbuf1_sq_0_10, rbuf1_sq_1_10, rbuf2_0_10, rbuf2_1_10, rbuf2_sq_0_10, rbuf2_sq_1_10, rbuf3_0_10, rbuf3_1_10, 
+      CONST_PARAMETERS, (11+sliding_idx));
+    sliding_idx++;
   }
+
+  // sliding the rest of the window: 6 remaining
+  stage_1_y_conv(REGS_00, REGS_01, REGS_02, REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+  stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+    ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+    sliding_idx);
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_00, rbuf1_1_00, rbuf1_sq_0_00, rbuf1_sq_1_00, rbuf2_0_00, rbuf2_1_00, rbuf2_sq_0_00, rbuf2_sq_1_00, rbuf3_0_00, rbuf3_1_00, 
+    CONST_PARAMETERS, (11+sliding_idx));
+  sliding_idx++;
+
+  stage_1_y_conv(REGS_01, REGS_02, REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+  stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+    ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+    sliding_idx);
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_01, rbuf1_1_01, rbuf1_sq_0_01, rbuf1_sq_1_01, rbuf2_0_01, rbuf2_1_01, rbuf2_sq_0_01, rbuf2_sq_1_01, rbuf3_0_01, rbuf3_1_01, 
+    CONST_PARAMETERS, (11+sliding_idx));
+  sliding_idx++;
+
+  stage_1_y_conv(REGS_02, REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+  stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+    ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+    sliding_idx);
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_02, rbuf1_1_02, rbuf1_sq_0_02, rbuf1_sq_1_02, rbuf2_0_02, rbuf2_1_02, rbuf2_sq_0_02, rbuf2_sq_1_02, rbuf3_0_02, rbuf3_1_02, 
+    CONST_PARAMETERS, (11+sliding_idx));
+  sliding_idx++;
+
+  stage_1_y_conv(REGS_03, REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, REGS_02, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+  stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+    ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+    sliding_idx);
+  stage_0_load_data_x_conv<true>(
+    rbuf1_0_03, rbuf1_1_03, rbuf1_sq_0_03, rbuf1_sq_1_03, rbuf2_0_03, rbuf2_1_03, rbuf2_sq_0_03, rbuf2_sq_1_03, rbuf3_0_03, rbuf3_1_03, 
+    CONST_PARAMETERS, (11+sliding_idx));
+  sliding_idx++;
+
+  stage_1_y_conv(REGS_04, REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, REGS_02, REGS_03, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+  stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+    ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+    sliding_idx);
+  stage_0_load_data_x_conv<false>(
+    rbuf1_0_04, rbuf1_1_04, rbuf1_sq_0_04, rbuf1_sq_1_04, rbuf2_0_04, rbuf2_1_04, rbuf2_sq_0_04, rbuf2_sq_1_04, rbuf3_0_04, rbuf3_1_04, 
+    CONST_PARAMETERS, (11+sliding_idx));
+  sliding_idx++;
+
+  stage_1_y_conv(REGS_05, REGS_06, REGS_07, REGS_08, REGS_09, REGS_10, REGS_00, REGS_01, REGS_02, REGS_03, REGS_04, mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr);
+  stage_2_compute_ssim_store(mu1_arr, sigma1_sq_arr, mu2_arr, sigma2_sq_arr, sigma12_arr, 
+    ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12, C1, C2, channel, H, W, block_data_x, block_data_y, thread_local_data_x,
+    sliding_idx);
 }
 
-/*
-__global__ void fusedssimCUDA(
-  int H,
-  int W,
-  int CH,
-  float C1,
-  float C2,
-  float* img1,
-  float* img2,
-  float* ssim_map,
-  float* dm_dmu1 = nullptr,
-  float* dm_dsigma1_sq = nullptr,
-  float* dm_dsigma12 = nullptr
-)
-{
-  auto block = cg::this_thread_block();
-  const int pix_y = block.group_index().y * BY + block.thread_index().y;
-  const int pix_x = block.group_index().x * BX + block.thread_index().x * TILE_SIZE;
-  const int pix_id = pix_y * W + pix_x;
-  const int num_pix = H * W;
-  const int i = block.group_index().z;
-  const int batch = 0;
+#undef CONST_PARAMETERS
+#undef REGS_00
+#undef REGS_01
+#undef REGS_02
+#undef REGS_03
+#undef REGS_04
+#undef REGS_05
+#undef REGS_06
+#undef REGS_07
+#undef REGS_08
+#undef REGS_09
+#undef REGS_10
 
-  // shared memory that will be used to load pixels temporarily
-  __shared__ float sbuf1[SY*SX];
-  __shared__ float sbuf2[SY*SX];
-  __shared__ float sbuf3[CY*CX];
-  float rbuf1[RBUF_SIZE];
-
-  float mu1_arr[TILE_SIZE];
-  float sigma1_sq_arr[TILE_SIZE];
-  float mu2_arr[TILE_SIZE];
-  float sigma2_sq_arr[TILE_SIZE];
-  float sigma12_arr[TILE_SIZE];
-
-  // load into shared
-  load_into_shared(sbuf1, img1, CH, H, W, i);
-  block.sync();
-
-  load_into_shared(sbuf2, img2, CH, H, W, i);
-
-  // calculate mu1
-  do_separable_conv_x<false>(sbuf1, sbuf3, rbuf1);
-  block.sync();
-  do_separable_conv_y<false>(sbuf3, mu1_arr);
-  block.sync();
-
-  // calculate sigma1_sq
-  do_separable_conv_x<true>(sbuf1, sbuf3, rbuf1);
-  block.sync();
-  do_separable_conv_y<false>(sbuf3, sigma1_sq_arr);
-  // block.sync();
-  do_elementwise_mul_sub<TILE_SIZE>(sigma1_sq_arr, mu1_arr, mu1_arr);
-
-  // calculate mu2
-  // block.sync();
-  do_separable_conv_x<false>(sbuf2, sbuf3, rbuf1);
-  block.sync();
-  do_separable_conv_y<false>(sbuf3, mu2_arr);
-  // block.sync();
-
-  // calculate sigma2_sq
-  do_separable_conv_x<true>(sbuf2, sbuf3, rbuf1);
-  block.sync();
-  do_separable_conv_y<false>(sbuf3, sigma2_sq_arr);
-  do_elementwise_mul_sub<TILE_SIZE>(sigma2_sq_arr, mu2_arr, mu2_arr);
-  // block.sync();
-
-  // calculate sigma12
-  multiply_shared_mem(sbuf1, sbuf2);
-  block.sync();
-  do_separable_conv_x<false>(sbuf1, sbuf3, rbuf1);
-  block.sync();
-  do_separable_conv_y<false>(sbuf3, sigma12_arr);
-  do_elementwise_mul_sub<TILE_SIZE>(sigma12_arr, mu1_arr, mu2_arr);
-  block.sync();
-
-  // calculate SSIM
-  #pragma unroll
-  for (int ii = 0; ii < TILE_SIZE; ++ii) {
-    const float mu1 = mu1_arr[ii];
-    const float mu2 = mu2_arr[ii];
-    const float sigma1_sq = sigma1_sq_arr[ii];
-    const float sigma2_sq = sigma2_sq_arr[ii];
-    const float sigma12 = sigma12_arr[ii];
-
-    float mu1_sq = mu1 * mu1;
-    float mu2_sq = mu2 * mu2;
-    float mu1_mu2 = mu1 * mu2;
-    float C = (2.0f * mu1_mu2 + C1);
-    float D = (2.0f * sigma12 + C2);
-    float A = (mu1_sq + mu2_sq + C1);
-    float B = (sigma1_sq + sigma2_sq + C2);
-    float m = (C * D) / (A * B);
-    if (pix_x + ii < W && pix_y < H) {
-      const int global_idx = batch * CH * num_pix + i * num_pix + pix_id + ii;
-      ssim_map[global_idx] = m;
-
-      if (dm_dmu1) {
-        dm_dmu1[global_idx] = (
-          (mu2 * 2.0f * D) / (A * B)
-          -(mu2 * 2.0f * C) / (A * B)
-          -(mu1 * 2.0f * C * D) / ( A * A * B)
-          +(mu1 * 2.0f * C * D) / (A * B * B)
-        );
-        dm_dsigma1_sq[global_idx] = ((-C * D) / (A * B * B));
-        dm_dsigma12[global_idx] = ((2 * C) / (A * B));
-      }
-    }
-  }
-}
-*/
 __global__ void fusedssim_backwardCUDA(
   int H,
   int W,
@@ -716,9 +647,9 @@ fusedssim_opt(
   dim3 grid((W + BX - 1) / BX, (H + BY - 1) / BY, CH);
   // dim3 block(BX, BY, 1);
   dim3 block(WARP_SIZE);
-  printf("B: %d, CH: %d, H: %d, W: %d\n", B, CH, H, W);
-  printf("grid: %d %d %d\n", grid.x, grid.y, grid.z);
-  printf("block: %d %d %d\n", block.x, block.y, block.z);
+  // printf("B: %d, CH: %d, H: %d, W: %d\n", B, CH, H, W);
+  // printf("grid: %d %d %d\n", grid.x, grid.y, grid.z);
+  // printf("block: %d %d %d\n", block.x, block.y, block.z);
 
   torch::Tensor target = torch::zeros_like(img1).contiguous();
   torch::Tensor dm_dmu1 = train ? torch::zeros_like(img1).contiguous() : torch::empty(0);
