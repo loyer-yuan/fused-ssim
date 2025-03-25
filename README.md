@@ -122,18 +122,24 @@ block.sync();
 卷积运算公式
 
 One block calculate (BX, BY) datas: 
+```math
 $$
 \frac{3 \cdot 5 \cdot (BX \cdot (BY+10) \cdot 11+BX \cdot BY \cdot 11)}{32} \rightarrow \\ 
 \frac{165BX \cdot (BY+5)}{16}(one\ block\ conv.\ FFMA\ inst.)
 $$
+```
 Block number:
+```math
 $$
 numBlock=\left \lceil \frac{X}{BX} \right \rceil \cdot \left \lceil \frac{Y}{BY} \right \rceil
 $$
+```
 All calculations:
+```math
 $$
 cals = \left \lceil \frac{X}{BX} \right \rceil \cdot \left \lceil \frac{Y}{BY} \right \rceil \cdot \frac{165BX \cdot (BY+5)}{16}
 $$
+```
 由上面的式子不难看出，在当前的计算模式下，BY越小，冗余计算越多。
 
 ## V3-0: Soft Pipeline but local memory
