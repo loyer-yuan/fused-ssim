@@ -158,7 +158,7 @@ $$
 - 通过手动控制软流水，warp stall的情况大幅度改善。stall no instruction的情况下降了55%，来到了3.94 cycles per instruction ，这是最主要的stall的原因。其他stall的原因也减少了很多。这也提升了SM Througput。
 - 通过手写软流水，也消除了local memory，让DRAM Throughput回到了正常的水平。
 
-## V3: Soft Pipeline (final version)
+## V3: Soft Pipeline
 
 相比于V3-1，主要改变的是取数时候的条件判断。该条件判断是用来防止非法的内存访问。但使用__pipeline_memcpy_async中fillzero的参数，使得这条指令在访问非法内存的时候，填充0到shared memory中，但内存的访问还是非法。
 
@@ -172,7 +172,7 @@ $$
 - 性能相比于v3，提升了50.03%。
 - 虽然还是一样的软流水的思路，但是换了一种实现的方式，规避了v3软流水实现方式的缺点，拿到了真正的收益。这里也有一部分原因是因为NVIDIA SASS指令的FFMA 是有包含4个操作数，这样既能做乘加融合，也能加结果返回到不同的寄存器，实现了move指令的功能，隐式地节省了很大的move指令开销。
 
-## V4: Advanced and Safe Soft Pipeline
+## V4: Advanced and Safe Soft Pipeline (final version)
 
 相比于V4-1，在请求global memory访存的时候多了条件判断，而不是用fill zero的方式去做，这样开销会增大，但是不会出现illegal memory access。
 
